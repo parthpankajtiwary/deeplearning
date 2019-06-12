@@ -7,6 +7,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, sampler
 from torchvision import datasets, transforms 
 
+from improving_dcgan import * 
+
 #hyperparams 
 batch_size = 128
 num_workers = 0 
@@ -27,74 +29,6 @@ if torch.cuda.is_available():
 	device = 'cuda'
 print('Using {}'.format(device))
 
-#Discriminator network 
-class Discriminator(nn.Module):
-	def __init__(self, conv_dim=32, num_classes=10):
-		super(Discriminator, self).__init__()
-
-		#complete init
-		self.conv_dim = conv_dim 
-		self.num_classes = num_classes
-
-		self.features = nn.Sequential(
-			nn.Dropout(dropout),
-			#32x32 input 
-			conv(3, conv_dim, 4, batch_norm=False), #first layer, no batch_norm
-			gelu(),
-			nn.Dropout(dropout),
-			#16x16 out 
-			conv(conv_dim, 2*conv_dim, 4),
-			gelu(),
-			nn.Dropout(dropout),
-			#8x8 out 
-			conv(2*conv_dim, 4*conv_dim, 4),
-			gelu(),
-			nn.Dropout(dropout),
-			#4x4 out 
-			conv(4*conv_dim, 8*conv_dim, 4),
-			gelu(),
-			nn.Dropout(0.1)
-			)
-	
-		self.classifier = nn.Sequential(
-			#to a denser layer
-			nn.Dropout(dropout),
-			nn.Linear(1024, conv_dim*4*4*4),
-			gelu(),
-			#another dense for fine parametarization
-			nn.Dropout(dropout),
-			nn.Linear(conv_dim*4*4*4, conv_dim*4*4*4),
-			gelu(),
-			#to 10 logits
-			nn.Dropout(0.1),
-			nn.Linear(conv_dim*4*4*4, num_classes),
-			)
-		self.fc = nn.Linear(1024, num_classes)
-
-
-	def forward(self, x, matching=False):
-		#all hidden layers with LeakyReLU activations 
-		x = self.features(x)
-	
-		#flatten and pass to dense layer for classification
-		f = x.view(-1, 1024)
-
-		x = self.fc(f)
-
-		if matching:
-			return f, x
-		else:
-			return x 
-
-#scale an image to floats in (-1,1)
-def scale(x, feat_range=(-1,1)):
-	''' Scale takes in an image x and returns that image, scaled
-       with a feature_range of pixel values from -1 to 1. 
-       This function assumes that the input x is already scaled from 0-1.'''
-    # assume x is scaled to (0, 1)
-    # scale to feature_range and return scaled x
-	min, max = feat_range
-	return x * (max - min) + min
 
 def train(D, trainloader, testloader, opt, epoch0):
 	train_losses, test_losses, accuracies = [], [], []
@@ -156,7 +90,7 @@ def train_discriminator(labeled_ratio, only_dense=False):
 								drop_last=True, num_workers=num_workers)
 
 	#load Discriminator network
-	checkpoint_d = torch.load('checkpoints/discriminator.pth')
+	checkpoint_d = torch.load('checkpoints/discriminator50.pth')
 	D = Discriminator(conv_dim).to(device)
 	d_opt = torch.optim.Adam(D.parameters(), lr, [beta1,beta2], weight_decay=wd)
 	D.load_state_dict(checkpoint_d['model_state_dict'])
