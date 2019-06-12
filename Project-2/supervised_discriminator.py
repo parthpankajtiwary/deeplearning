@@ -94,7 +94,7 @@ def train_discriminator(labeled_ratio, only_dense=False):
 	d_opt = torch.optim.Adam(D.parameters(), lr, [beta1,beta2], weight_decay=wd)
 	D.load_state_dict(checkpoint_d['model_state_dict'])
 	d_opt.load_state_dict(checkpoint_d['optimizer_state_dict'])
-	epoch0 = checkpoint_d['epoch']
+	epoch0 = checkpoint_d['epoch'] + 1
 	loss = checkpoint_d['loss']
 
 	if only_dense:
