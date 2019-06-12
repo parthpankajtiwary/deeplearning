@@ -11,20 +11,34 @@ from torchvision import datasets, transforms
 #hyperparams 
 batch_size = 128
 num_workers = 0 
-conv_dim = 32 
+conv_dim = 32
 z_size = 100
-lr = 1e-04
+lr = 3e-04
 beta1 = .5 
 beta2 = .999
-num_epochs = 100
-img_size = 32 
-dropout = 0.
+num_epochs = 50
+img_size = 32
+dropout = 0.5
+labeled_ratio = 0.125
+wd = 1e-04
 
 device = 'cpu'
 if torch.cuda.is_available():
 	#move models to GPU 
 	device = 'cuda'
 print('Using {}'.format(device))
+
+#the gelu activation function 
+class gelu(nn.Module):
+    def __init__(self):
+        super(gelu, self).__init__()
+
+    def forward(self, x):
+        return gelu_fn(x)
+
+
+def gelu_fn(x):
+    return 0.5 * x * (1 + torch.tanh(0.7978845608028654*(x+0.044715*x**3)))
 
 #plot the training losses for the GAN network
 def plot_losses(losses):
@@ -34,6 +48,14 @@ def plot_losses(losses):
 	plt.plot(losses.T[1], label='Generator', alpha=.5)
 	plt.title('Training GAN Losses')
 	plt.legend()
+	plt.show()
+
+#plot the accuracy of the discriminator as classifier on the validation split 
+def plot_acc(accs):
+	plt.title('Discriminator test accuracy with labeled_ratio={}'.format(labeled_ratio))
+	plt.xlabel('epochs')
+	plt.ylabel('top-1 accuracy')
+	plt.plot(accs, '-r')
 	plt.show()
 
 #plot some sample images with their labels
@@ -107,56 +129,6 @@ def deconv(in_channels, out_channels, kernel_size, stride=2, padding=1, batch_no
 
 	return nn.Sequential(*layers)
 
-def out_from_logits(x):
-	# new discriminator output based on 
-	# the "Improving Techniques for GANs" paper
-	x = torch.sum(torch.exp(x), dim=1)
-	x = x / (x+1)
-	return x
-
-def real_loss(D_out, smooth=False):
-	batch_size_ = D_out.size(0)
-	# label smoothing
-	if smooth:
-		# smooth, real labels = 0.9
-		labels = torch.ones(batch_size_)*0.9
-	else:
-		labels = torch.ones(batch_size_) # real labels = 1
-
-	#move labels to GPU if available     
-	labels = labels.to(device)
-
-	#binary cross entropy with logits loss
-	criterion = nn.BCEWithLogitsLoss().to(device)
-
-	#calculate loss
-	loss = criterion(out_from_logits(D_out), labels)
-
-	return loss
-
-def fake_loss(D_out):
-	batch_size_ = D_out.size(0)
-	labels = torch.zeros(batch_size_).to(device) # fake labels = 0
-
-	criterion = nn.BCEWithLogitsLoss().to(device)
-
-	# calculate loss
-	loss = criterion(out_from_logits(D_out), labels)
-
-	return loss
-
-def supervised_loss(D_out, labels, mask):
-	batch_size = D_out.size(0)
-
-	#cross-entropy loss for regular supervised multi-classification loss
-	criterion = nn.CrossEntropyLoss().to(device)
-
-	#apply labeling mask to hide unwanted labels
-	NotImplemented
-	loss = criterion(mask(D_out.squeeze()), labels)
-
-	return loss 
-
 #Discriminator network 
 class Discriminator(nn.Module):
 	def __init__(self, conv_dim=32, num_classes=10):
@@ -167,36 +139,48 @@ class Discriminator(nn.Module):
 		self.num_classes = num_classes
 
 		self.features = nn.Sequential(
-			#nn.Dropout(dropout),
+			nn.Dropout(dropout),
 			#32x32 input 
 			conv(3, conv_dim, 4, batch_norm=False), #first layer, no batch_norm
-			nn.LeakyReLU(0.2, inplace=True), 
+			gelu(),
 			nn.Dropout(dropout),
 			#16x16 out 
 			conv(conv_dim, 2*conv_dim, 4),
-			nn.LeakyReLU(0.2, inplace=True),
+			gelu(),
 			nn.Dropout(dropout),
 			#8x8 out 
 			conv(2*conv_dim, 4*conv_dim, 4),
-			nn.LeakyReLU(0.2, inplace=True),
+			gelu(),
 			nn.Dropout(dropout),
 			#4x4 out 
-			conv(4*conv_dim, 8*conv_dim, 4, batch_norm=False),
-			#nn.LeakyReLU(0.2, inplace=True),
-			#nn.Dropout(dropout),			
-			#2x2 out
+			conv(4*conv_dim, 8*conv_dim, 4),
+			gelu(),
+			nn.Dropout(0.1)
 			)
-
-		self.fc = nn.Linear(conv_dim*(4**4), num_classes)
+	
+		self.classifier = nn.Sequential(
+			#to a denser layer
+			nn.Dropout(dropout),
+			nn.Linear(1024, conv_dim*4*4*4),
+			gelu(),
+			#another dense for fine parametarization
+			nn.Dropout(dropout),
+			nn.Linear(conv_dim*4*4*4, conv_dim*4*4*4),
+			gelu(),
+			#to 10 logits
+			nn.Dropout(0.1),
+			nn.Linear(conv_dim*4*4*4, num_classes),
+			)
+		self.fc = nn.Linear(1024, num_classes)
 
 
 	def forward(self, x, matching=False):
 		#all hidden layers with LeakyReLU activations 
 		x = self.features(x)
-
-		#flatten 
-		f = x.view(-1, self.conv_dim*(4**4))
 	
+		#flatten and pass to dense layer for classification
+		f = x.view(-1, 1024)
+
 		x = self.fc(f)
 
 		if matching:
@@ -210,8 +194,9 @@ class Generator(nn.Module):
 		super(Generator, self).__init__()
 		self.conv_dim = conv_dim
 
-		#first dense layer
+		#first dense and bn layer
 		self.fc = nn.Linear(z_size, conv_dim*(4**3))
+		self.bn = nn.BatchNorm2d(conv_dim*4)
 
 		#transpose conv layers 
 		self.t_conv1 = deconv(4*conv_dim, conv_dim*2, 4)
@@ -219,13 +204,14 @@ class Generator(nn.Module):
 		self.t_conv3 = deconv(conv_dim, 3, 4, batch_norm=False)
 
 	def forward(self, x):
-		#dense layer + reshape 
+		#dense layer + reshape + bn
 		x = self.fc(x)
 		x = x.view(-1, self.conv_dim*4, 4, 4) #batch_size x 4 x 4 
+		#x = gelu_fn(self.bn(x))
 
 		#transpose conv layers with ReLUs
-		x = F.relu(self.t_conv1(x))
-		x = F.relu(self.t_conv2(x))
+		x = gelu_fn(self.t_conv1(x))
+		x = gelu_fn(self.t_conv2(x))
 		x = torch.tanh(self.t_conv3(x))
 
 		return x
@@ -252,12 +238,13 @@ def LSE(before_softmax_output):
 	return output
 
 #split every batch to labeled+unlabeled batch for semi-supervised-mode
-def batch_split(x, y, labeled_ratio = .25):
+def batch_split(x, y, labeled_ratio):
 	batch_size = x.size(0)
-	return x[:labeled_ratio * batch_size], x[labeled_ratio * batch_size:], y[:labeled_ratio * batch_size]
+	cap = int(labeled_ratio * batch_size)
+	return x[:cap], x[cap:], y[:cap]
 
 def train(D, G, trainloader, testloader, d_opt, g_opt):
-	samples, losses = [], [] 
+	samples, losses, accuracies = [], [], [] 
 	print_step = 300 
 
 	# Get some fixed data for sampling. These are images that are held
@@ -267,6 +254,7 @@ def train(D, G, trainloader, testloader, d_opt, g_opt):
 	fixed_z = torch.from_numpy(fixed_z).float().to(device)
 
 	for epoch in range(num_epochs):
+		epoch_D_loss, epoch_G_loss = 0., 0.
 		for batch_idx, (imgs, labels) in enumerate(trainloader):
 			batch_size = imgs.size(0)
 			imgs = scale(imgs)
@@ -279,22 +267,25 @@ def train(D, G, trainloader, testloader, d_opt, g_opt):
 			imgs = imgs.to(device)
 			labels = labels.to(device)
 
-			'''  FOR SEMI_SUPERVISED
-
-			label_imgs, unlabel_imgs, labels = batch_split(imgs, labels)
+			##  FOR SEMI_SUPERVISED
+			
+			label_imgs, unlabel_imgs, labels = batch_split(imgs, labels, labeled_ratio)
+			label_imgs = label_imgs.to(device)
+			unlabel_imgs = unlabel_imgs.to(device)
+			labels = labels.to(device)
 
 			D_label_out = D(label_imgs)
-			D_supervised_loss = nn.CrossEntropyLoss(D_label_out, labels)
+			D_supervised_loss = F.cross_entropy(D_label_out, labels, reduction='sum')
 
 			D_unlab_out = D(unlabel_imgs)
 			D_real_loss = - torch.mean(LSE(D_unlab_out), 0) + torch.mean(F.softplus(LSE(D_unlab_out), 1), 0)
+			
 			'''
-
 			D_out = D(imgs)
 			D_supervised_loss = 0
 			#D_real_loss = real_loss(D_out)
 			D_real_loss = - torch.mean(LSE(D_out), 0) + torch.mean(F.softplus(LSE(D_out), 1), 0)
-
+			'''
 			#step 2. Train with fake Images 
 			#Compute Discriminator unsup-fake-loss 
 			z = np.random.uniform(-1, 1, size=(batch_size, z_size))
@@ -308,6 +299,8 @@ def train(D, G, trainloader, testloader, d_opt, g_opt):
 			D_loss = D_supervised_loss + D_real_loss + D_fake_loss
 			D_loss.backward()
 			d_opt.step()
+
+			epoch_D_loss += D_loss.item()
 
 			#train the Generator
 			g_opt.zero_grad()
@@ -332,15 +325,14 @@ def train(D, G, trainloader, testloader, d_opt, g_opt):
 			G_loss.backward()
 			g_opt.step()
 
-			#Print some Loss stuff 
-			if batch_idx % print_step == 0:
-				#append Discriminator losses and Generator losses
-				losses.append((D_loss.item(), G_loss.item()))
+			epoch_G_loss += G_loss.item()
 				
-				#print losses 
-				print('Epoch [{:5d}/{:5d}] | D_loss: {:6.4f} | G_loss: {:6.4f}'.format(
-					epoch+1, num_epochs, D_loss.item(), G_loss.item()))
-
+		epoch_D_loss /= batch_idx
+		epoch_G_loss /= batch_idx
+		#print losses 
+		losses.append((epoch_D_loss, epoch_G_loss))
+		print('Epoch [{:5d}/{:5d}] | D_loss: {:6.4f} | G_loss: {:6.4f}'.format(
+				epoch+1, num_epochs, epoch_D_loss, epoch_G_loss))
 
 		##AFTER EACH EPOCH
 		#generate and save sample fake Images
@@ -349,8 +341,9 @@ def train(D, G, trainloader, testloader, d_opt, g_opt):
 		samples.append(samples_z)
 		G.train() #back to training mode 
 
-		#test discriminator's accuracy on test splti
-		#test_acc = test(D, testloader)
+		#test discriminator's accuracy on validation split
+		test_acc = test(D, testloader)
+		accuracies.append(test_acc)
 
 		#save state dicts
 		torch.save({
@@ -358,21 +351,21 @@ def train(D, G, trainloader, testloader, d_opt, g_opt):
 			'model_state_dict' 		:	D.state_dict(),
 			'optimizer_state_dict'	:	d_opt.state_dict(),
 			'loss'					:	D_loss
-			}, '/discriminator.pth')
+			}, '/content/checkpoints/discriminator00.pth')
 
 		torch.save({
 			'epoch'					:	epoch,
 			'model_state_dict'		:	G.state_dict(),
 			'optimizer_state_dict'	:	g_opt.state_dict(),
 			'loss'					: 	G_loss
-			}, '/generator.pth')
+			}, '/content/checkpoints/generator00.pth')
 
 	#Save and view some training generator samples
 	with open('train_samples.pkl', 'wb') as f:
 		pickle.dump(samples, f)
 	view_samples(-1, samples)
 
-	return losses
+	return losses, accuracies
 
 def test(D, testloader):
 	D.eval()
@@ -383,12 +376,12 @@ def test(D, testloader):
 		labels = labels.to(device)
 
 		out = D(imgs)
-		test_loss += F.cross_entropy(out, labels, size_average=False).item()
-		predictions = D.data.max(1, keepdim=True)[1] 
+		test_loss += F.cross_entropy(out, labels, reduction='sum').item()
+		predictions = out.data.max(1, keepdim=True)[1] 
 		correct += predictions.eq(labels.data.view_as(predictions)).to(device).sum()
 	test_loss /= len(testloader.dataset)
 	accuracy = 100. * correct / len(testloader.dataset)
-	print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+	print('Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
 		test_loss, correct, len(testloader.dataset), accuracy))
 
 	return accuracy
@@ -402,7 +395,7 @@ def main():
 	#SVHN dataset 
 	train_data = datasets.SVHN(root='data/', split='train', download=True, transform=tf)
 	test_data  = datasets.SVHN(root='data/', split='test', download=True, transform=tf)
-	trainloader = DataLoader(dataset=train_data, batch_size=batch_size, shuffle=True, 
+	trainloader = DataLoader(dataset=train_data, batch_size=batch_size, shuffle=False, 
 								drop_last=True, num_workers=num_workers)
 	testloader  = DataLoader(dataset=test_data, batch_size=batch_size, shuffle=False, 
 								drop_last=True, num_workers=num_workers)
@@ -412,12 +405,13 @@ def main():
 	G = Generator(z_size=z_size, conv_dim=conv_dim).to(device)
 
 	#define optimizers
-	d_opt = torch.optim.Adam(D.parameters(), lr, [beta1,beta2])
-	g_opt = torch.optim.Adam(G.parameters(), lr, [beta1,beta2])
+	d_opt = torch.optim.Adam(D.parameters(), lr, [beta1,beta2], weight_decay=wd)
+	g_opt = torch.optim.Adam(G.parameters(), lr, [beta1,beta2], weight_decay=wd)
 
 	#train GAN
-	losses = train(D, G, trainloader, testloader, d_opt, g_opt)
+	losses, accuracies = train(D, G, trainloader, testloader, d_opt, g_opt)
 	plot_losses(losses)
+	plot_acc(accuracies)
 
 if __name__ == '__main__':
 	main()
