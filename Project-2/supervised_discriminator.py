@@ -2,7 +2,6 @@ from matplotlib import pyplot as plt
 import numpy as np 
 
 import torch 
-import torch.nn as nn 
 import torch.nn.functional as F 
 from torch.utils.data import DataLoader, sampler
 from torchvision import datasets, transforms 
